@@ -10,6 +10,8 @@ from flask import (
 import sqlite3
 import os
 import requests
+import hashlib
+import hmac
 import psycopg2
 from psycopg2.extras import RealDictCursor
 from datetime import datetime
@@ -37,6 +39,7 @@ USANDO_POSTGRES = bool(DATABASE_URL)
 
 MERCADO_PAGO_ACCESS_TOKEN = os.environ.get("MERCADO_PAGO_ACCESS_TOKEN")
 MERCADO_PAGO_PLAN_ID = os.environ.get("MERCADO_PAGO_PLAN_ID")
+MERCADO_PAGO_WEBHOOK_SECRET = os.environ.get("MERCADO_PAGO_WEBHOOK_SECRET")
 
 
 # =====================================================
@@ -159,6 +162,19 @@ adicionar_coluna_se_nao_existir(
     "usuarios",
     "plano",
     "TEXT DEFAULT 'Gratis'"
+)
+
+
+adicionar_coluna_se_nao_existir(
+    "usuarios",
+    "mercado_pago_subscription_id",
+    "TEXT"
+)
+
+adicionar_coluna_se_nao_existir(
+    "usuarios",
+    "mercado_pago_status",
+    "TEXT"
 )
 
 adicionar_coluna_se_nao_existir(
@@ -1736,58 +1752,293 @@ def assinar_pro():
     if not usuario_logado():
         return redirect("/login")
 
-    if not MERCADO_PAGO_ACCESS_TOKEN or not MERCADO_PAGO_PLAN_ID:
+    if not MERCADO_PAGO_ACCESS_TOKEN:
         return (
             "Mercado Pago ainda não está configurado no servidor.",
             500
         )
 
-    url = (
-        "https://api.mercadopago.com/preapproval_plan/"
-        + MERCADO_PAGO_PLAN_ID
-    )
+    conexao = conectar_banco()
+
+    usuario = executar(conexao, """
+        SELECT *
+        FROM usuarios
+        WHERE id = ?
+    """, (
+        session["usuario_id"],
+    )).fetchone()
+
+    conexao.close()
+
+    if not usuario:
+        session.clear()
+        return redirect("/login")
+
+    # Criamos uma assinatura individual em status pending.
+    # Assim o external_reference identifica exatamente qual
+    # usuário do OrçaFácil iniciou a assinatura.
+    url = "https://api.mercadopago.com/preapproval"
 
     headers = {
         "Authorization": f"Bearer {MERCADO_PAGO_ACCESS_TOKEN}",
         "Content-Type": "application/json"
     }
 
+    dados = {
+        "reason": "OrçaFácil Pro",
+        "external_reference": str(usuario["id"]),
+        "payer_email": usuario["email"],
+        "auto_recurring": {
+            "frequency": 1,
+            "frequency_type": "months",
+            "transaction_amount": 29.90,
+            "currency_id": "BRL"
+        },
+        "back_url": request.url_root.rstrip("/") + "/planos",
+        "status": "pending"
+    }
+
     try:
-        resposta = requests.get(
+        resposta = requests.post(
             url,
+            json=dados,
             headers=headers,
             timeout=30
         )
-
     except requests.RequestException:
-
         return (
-            "Não foi possível conectar ao Mercado Pago.",
+            "Não foi possível conectar ao Mercado Pago. "
+            "Tente novamente em alguns instantes.",
             502
         )
 
-    if resposta.status_code != 200:
-
+    if resposta.status_code not in (200, 201):
         return (
-            "Não foi possível carregar o plano Pro.<br><br>"
+            "Não foi possível iniciar a assinatura.<br><br>"
             f"Código: {resposta.status_code}<br>"
             f"Resposta: {resposta.text}",
             502
         )
 
-    plano = resposta.json()
+    assinatura = resposta.json()
+    assinatura_id = assinatura.get("id")
+    assinatura_status = assinatura.get("status")
+    link_pagamento = assinatura.get("init_point")
 
-    link_pagamento = plano.get("init_point")
+    if assinatura_id:
+        conexao = conectar_banco()
+
+        executar(conexao, """
+            UPDATE usuarios
+            SET mercado_pago_subscription_id = ?,
+                mercado_pago_status = ?
+            WHERE id = ?
+        """, (
+            assinatura_id,
+            assinatura_status,
+            usuario["id"]
+        ))
+
+        conexao.commit()
+        conexao.close()
 
     if not link_pagamento:
-
         return (
-            "O Mercado Pago não retornou "
-            "o link de pagamento.",
+            "O Mercado Pago criou a assinatura, "
+            "mas não retornou o link de pagamento.",
             502
         )
 
     return redirect(link_pagamento)
+
+
+# =====================================================
+# WEBHOOK MERCADO PAGO
+# =====================================================
+
+def validar_webhook_mercado_pago():
+
+    if not MERCADO_PAGO_WEBHOOK_SECRET:
+        return False
+
+    assinatura_recebida = request.headers.get("x-signature", "")
+    request_id = request.headers.get("x-request-id", "")
+
+    partes = {}
+
+    for parte in assinatura_recebida.split(","):
+        if "=" in parte:
+            chave, valor = parte.strip().split("=", 1)
+            partes[chave] = valor
+
+    ts = partes.get("ts")
+    v1 = partes.get("v1")
+
+    if not ts or not v1:
+        return False
+
+    corpo = request.get_json(silent=True) or {}
+
+    data_id = (
+        request.args.get("data.id")
+        or request.args.get("id")
+        or (corpo.get("data") or {}).get("id")
+    )
+
+    if data_id is not None:
+        data_id = str(data_id).lower()
+
+    manifesto = ""
+
+    if data_id:
+        manifesto += f"id:{data_id};"
+
+    if request_id:
+        manifesto += f"request-id:{request_id};"
+
+    manifesto += f"ts:{ts};"
+
+    assinatura_calculada = hmac.new(
+        MERCADO_PAGO_WEBHOOK_SECRET.encode("utf-8"),
+        manifesto.encode("utf-8"),
+        hashlib.sha256
+    ).hexdigest()
+
+    return hmac.compare_digest(
+        assinatura_calculada,
+        v1
+    )
+
+
+@app.route("/webhook/mercadopago", methods=["POST"])
+def webhook_mercado_pago():
+
+    if not validar_webhook_mercado_pago():
+        return "Assinatura inválida", 401
+
+    corpo = request.get_json(silent=True) or {}
+
+    tipo = (
+        corpo.get("type")
+        or request.args.get("type")
+        or request.args.get("topic")
+        or ""
+    )
+
+    data_id = (
+        (corpo.get("data") or {}).get("id")
+        or request.args.get("data.id")
+        or request.args.get("id")
+    )
+
+    if not data_id:
+        return "OK", 200
+
+    headers = {
+        "Authorization": f"Bearer {MERCADO_PAGO_ACCESS_TOKEN}",
+        "Content-Type": "application/json"
+    }
+
+    # Atualizações da assinatura.
+    if tipo == "subscription_preapproval":
+
+        try:
+            resposta = requests.get(
+                f"https://api.mercadopago.com/preapproval/{data_id}",
+                headers=headers,
+                timeout=30
+            )
+        except requests.RequestException:
+            return "Erro temporário", 500
+
+        if resposta.status_code != 200:
+            return "OK", 200
+
+        assinatura = resposta.json()
+
+        usuario_id = assinatura.get("external_reference")
+        status = assinatura.get("status")
+
+        if usuario_id:
+            novo_plano = (
+                "Pro"
+                if status == "authorized"
+                else "Gratis"
+            )
+
+            conexao = conectar_banco()
+
+            executar(conexao, """
+                UPDATE usuarios
+                SET plano = ?,
+                    mercado_pago_subscription_id = ?,
+                    mercado_pago_status = ?
+                WHERE id = ?
+            """, (
+                novo_plano,
+                assinatura.get("id"),
+                status,
+                usuario_id
+            ))
+
+            conexao.commit()
+            conexao.close()
+
+        return "OK", 200
+
+    # Cobranças recorrentes autorizadas.
+    if tipo == "subscription_authorized_payment":
+
+        try:
+            resposta = requests.get(
+                f"https://api.mercadopago.com/authorized_payments/{data_id}",
+                headers=headers,
+                timeout=30
+            )
+        except requests.RequestException:
+            return "Erro temporário", 500
+
+        if resposta.status_code != 200:
+            return "OK", 200
+
+        cobranca = resposta.json()
+
+        usuario_id = cobranca.get("external_reference")
+        pagamento = cobranca.get("payment") or {}
+        pagamento_status = pagamento.get("status")
+
+        if usuario_id:
+            novo_plano = (
+                "Pro"
+                if pagamento_status == "approved"
+                else "Gratis"
+            )
+
+            conexao = conectar_banco()
+
+            executar(conexao, """
+                UPDATE usuarios
+                SET plano = ?
+                WHERE id = ?
+            """, (
+                novo_plano,
+                usuario_id
+            ))
+
+            conexao.commit()
+            conexao.close()
+
+        return "OK", 200
+
+    # O Mercado Pago recomenda habilitar também notificações
+    # de pagamentos. Neste MVP nós as reconhecemos e respondemos,
+    # enquanto a situação do plano é controlada pelos eventos
+    # de assinatura acima.
+    if tipo == "payment":
+        return "OK", 200
+
+    return "OK", 200
+
 
 # =====================================================
 # PDF
