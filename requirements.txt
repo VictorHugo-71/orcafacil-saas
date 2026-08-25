@@ -3,3 +3,4 @@ gunicorn
 reportlab
 Werkzeug
 requests
+psycopg2-binary
