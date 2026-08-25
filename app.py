@@ -1742,71 +1742,52 @@ def assinar_pro():
             500
         )
 
-    conexao = conectar_banco()
-
-    usuario = executar(conexao, """
-        SELECT *
-        FROM usuarios
-        WHERE id = ?
-    """, (
-        session["usuario_id"],
-    )).fetchone()
-
-    conexao.close()
-
-    if not usuario:
-        session.clear()
-        return redirect("/login")
-
-    url = "https://api.mercadopago.com/preapproval"
+    url = (
+        "https://api.mercadopago.com/preapproval_plan/"
+        + MERCADO_PAGO_PLAN_ID
+    )
 
     headers = {
         "Authorization": f"Bearer {MERCADO_PAGO_ACCESS_TOKEN}",
         "Content-Type": "application/json"
     }
 
-    dados = {
-        "preapproval_plan_id": MERCADO_PAGO_PLAN_ID,
-        "reason": "OrçaFácil Pro",
-        "external_reference": str(usuario["id"]),
-        "payer_email": usuario["email"],
-        "back_url": request.url_root.rstrip("/") + "/planos"
-    }
-
     try:
-        resposta = requests.post(
+        resposta = requests.get(
             url,
-            json=dados,
             headers=headers,
             timeout=30
         )
+
     except requests.RequestException:
+
         return (
-            "Não foi possível conectar ao Mercado Pago. "
-            "Tente novamente em alguns instantes.",
+            "Não foi possível conectar ao Mercado Pago.",
             502
         )
 
-    if resposta.status_code not in (200, 201):
+    if resposta.status_code != 200:
+
         return (
-            "Não foi possível iniciar a assinatura.<br><br>"
+            "Não foi possível carregar o plano Pro.<br><br>"
             f"Código: {resposta.status_code}<br>"
             f"Resposta: {resposta.text}",
             502
         )
 
-    assinatura = resposta.json()
-    link_pagamento = assinatura.get("init_point")
+    plano = resposta.json()
+
+    link_pagamento = plano.get("init_point")
 
     if not link_pagamento:
+
         return (
-            "O Mercado Pago criou a assinatura, "
-            "mas não retornou o link de pagamento.",
+            "O Mercado Pago não retornou "
+            "o link de pagamento.",
             502
         )
 
     return redirect(link_pagamento)
-
 
 # =====================================================
 # PDF
