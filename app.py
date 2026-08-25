@@ -10,6 +10,8 @@ from flask import (
 import sqlite3
 import os
 import requests
+import psycopg2
+from psycopg2.extras import RealDictCursor
 from datetime import datetime
 from io import BytesIO
 from urllib.parse import quote
@@ -30,6 +32,11 @@ app.secret_key = os.environ.get(
 )
 
 BANCO = "orcamentos.db"
+DATABASE_URL = os.environ.get("DATABASE_URL")
+USANDO_POSTGRES = bool(DATABASE_URL)
+
+MERCADO_PAGO_ACCESS_TOKEN = os.environ.get("MERCADO_PAGO_ACCESS_TOKEN")
+MERCADO_PAGO_PLAN_ID = os.environ.get("MERCADO_PAGO_PLAN_ID")
 
 
 # =====================================================
@@ -37,19 +44,48 @@ BANCO = "orcamentos.db"
 # =====================================================
 
 def conectar_banco():
+    """
+    No Render, usa PostgreSQL através da variável DATABASE_URL.
+    No computador local, se DATABASE_URL não existir, continua usando SQLite.
+    """
+    if USANDO_POSTGRES:
+        return psycopg2.connect(
+            DATABASE_URL,
+            cursor_factory=RealDictCursor
+        )
+
     conexao = sqlite3.connect(BANCO)
     conexao.row_factory = sqlite3.Row
     return conexao
 
 
+def executar(conexao, sql, parametros=()):
+    """
+    Executa a mesma consulta tanto no SQLite quanto no PostgreSQL.
+    O SQLite usa ? nos parâmetros; o PostgreSQL usa %s.
+    """
+    if USANDO_POSTGRES:
+        sql = sql.replace("?", "%s")
+
+    cursor = conexao.cursor()
+    cursor.execute(sql, parametros)
+    return cursor
+
+
 def criar_banco():
 
     conexao = conectar_banco()
-    cursor = conexao.cursor()
 
-    cursor.execute("""
+    if USANDO_POSTGRES:
+        id_usuario = "SERIAL PRIMARY KEY"
+        id_orcamento = "SERIAL PRIMARY KEY"
+    else:
+        id_usuario = "INTEGER PRIMARY KEY AUTOINCREMENT"
+        id_orcamento = "INTEGER PRIMARY KEY AUTOINCREMENT"
+
+    executar(conexao, f"""
         CREATE TABLE IF NOT EXISTS usuarios (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id {id_usuario},
             nome TEXT NOT NULL,
             email TEXT UNIQUE NOT NULL,
             senha TEXT NOT NULL,
@@ -57,9 +93,9 @@ def criar_banco():
         )
     """)
 
-    cursor.execute("""
+    executar(conexao, f"""
         CREATE TABLE IF NOT EXISTS orcamentos (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id {id_orcamento},
             usuario_id INTEGER NOT NULL,
             empresa TEXT NOT NULL,
             telefone TEXT,
@@ -88,9 +124,21 @@ criar_banco()
 def adicionar_coluna_se_nao_existir(tabela, coluna, definicao):
 
     conexao = conectar_banco()
-    cursor = conexao.cursor()
 
-    cursor.execute(f"PRAGMA table_info({tabela})")
+    if USANDO_POSTGRES:
+        executar(
+            conexao,
+            f"ALTER TABLE {tabela} "
+            f"ADD COLUMN IF NOT EXISTS {coluna} {definicao}"
+        )
+        conexao.commit()
+        conexao.close()
+        return
+
+    cursor = executar(
+        conexao,
+        f"PRAGMA table_info({tabela})"
+    )
 
     colunas = [
         item["name"]
@@ -98,11 +146,10 @@ def adicionar_coluna_se_nao_existir(tabela, coluna, definicao):
     ]
 
     if coluna not in colunas:
-
-        cursor.execute(
+        executar(
+            conexao,
             f"ALTER TABLE {tabela} ADD COLUMN {coluna} {definicao}"
         )
-
         conexao.commit()
 
     conexao.close()
@@ -160,7 +207,7 @@ def contar_orcamentos_mes(usuario_id):
 
     conexao = conectar_banco()
 
-    registros = conexao.execute("""
+    registros = executar(conexao, """
         SELECT data
         FROM orcamentos
         WHERE usuario_id = ?
@@ -471,7 +518,7 @@ def cadastro():
 
         try:
 
-            conexao.execute("""
+            executar(conexao, """
                 INSERT INTO usuarios
                 (nome, email, senha, plano)
 
@@ -487,7 +534,7 @@ def cadastro():
 
             return redirect("/login")
 
-        except sqlite3.IntegrityError:
+        except (sqlite3.IntegrityError, psycopg2.IntegrityError):
 
             erro = """
             <div class="erro">
@@ -573,7 +620,7 @@ def login():
 
         conexao = conectar_banco()
 
-        usuario = conexao.execute("""
+        usuario = executar(conexao, """
             SELECT *
             FROM usuarios
             WHERE email = ?
@@ -676,7 +723,7 @@ def dashboard():
 
     conexao = conectar_banco()
 
-    usuario = conexao.execute("""
+    usuario = executar(conexao, """
         SELECT *
         FROM usuarios
         WHERE id = ?
@@ -684,7 +731,7 @@ def dashboard():
         session["usuario_id"],
     )).fetchone()
 
-    total_orcamentos = conexao.execute("""
+    total_orcamentos = executar(conexao, """
         SELECT COUNT(*) AS total
         FROM orcamentos
         WHERE usuario_id = ?
@@ -692,7 +739,7 @@ def dashboard():
         session["usuario_id"],
     )).fetchone()["total"]
 
-    total_valor = conexao.execute("""
+    total_valor = executar(conexao, """
         SELECT COALESCE(SUM(valor), 0) AS total
         FROM orcamentos
         WHERE usuario_id = ?
@@ -700,7 +747,7 @@ def dashboard():
         session["usuario_id"],
     )).fetchone()["total"]
 
-    clientes = conexao.execute("""
+    clientes = executar(conexao, """
         SELECT COUNT(DISTINCT cliente) AS total
         FROM orcamentos
         WHERE usuario_id = ?
@@ -708,7 +755,7 @@ def dashboard():
         session["usuario_id"],
     )).fetchone()["total"]
 
-    ultimos = conexao.execute("""
+    ultimos = executar(conexao, """
         SELECT *
         FROM orcamentos
 
@@ -915,7 +962,7 @@ def novo():
 
     conexao = conectar_banco()
 
-    usuario = conexao.execute("""
+    usuario = executar(conexao, """
         SELECT *
         FROM usuarios
         WHERE id = ?
@@ -1142,7 +1189,7 @@ def gerar():
 
     conexao = conectar_banco()
 
-    usuario = conexao.execute("""
+    usuario = executar(conexao, """
         SELECT *
         FROM usuarios
         WHERE id = ?
@@ -1189,9 +1236,7 @@ def gerar():
 
     conexao = conectar_banco()
 
-    cursor = conexao.cursor()
-
-    cursor.execute("""
+    sql_insert = """
         INSERT INTO orcamentos
         (
             usuario_id,
@@ -1208,24 +1253,35 @@ def gerar():
         )
 
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    """, (
-        session["usuario_id"],
-        empresa,
-        telefone,
-        cliente,
-        servico,
-        descricao,
-        valor,
-        prazo,
-        validade,
-        pagamento,
-        data
-    ))
+    """
+
+    if USANDO_POSTGRES:
+        sql_insert += " RETURNING id"
+
+    cursor = executar(
+        conexao,
+        sql_insert,
+        (
+            session["usuario_id"],
+            empresa,
+            telefone,
+            cliente,
+            servico,
+            descricao,
+            valor,
+            prazo,
+            validade,
+            pagamento,
+            data
+        )
+    )
+
+    if USANDO_POSTGRES:
+        id_orcamento = cursor.fetchone()["id"]
+    else:
+        id_orcamento = cursor.lastrowid
 
     conexao.commit()
-
-    id_orcamento = cursor.lastrowid
-
     conexao.close()
 
     return redirect(
@@ -1245,7 +1301,7 @@ def visualizar(id):
 
     conexao = conectar_banco()
 
-    usuario = conexao.execute("""
+    usuario = executar(conexao, """
         SELECT *
         FROM usuarios
         WHERE id = ?
@@ -1253,7 +1309,7 @@ def visualizar(id):
         session["usuario_id"],
     )).fetchone()
 
-    item = conexao.execute("""
+    item = executar(conexao, """
         SELECT *
         FROM orcamentos
 
@@ -1418,7 +1474,7 @@ def historico():
 
     conexao = conectar_banco()
 
-    usuario = conexao.execute("""
+    usuario = executar(conexao, """
         SELECT *
         FROM usuarios
         WHERE id = ?
@@ -1426,7 +1482,7 @@ def historico():
         session["usuario_id"],
     )).fetchone()
 
-    itens = conexao.execute("""
+    itens = executar(conexao, """
         SELECT *
         FROM orcamentos
 
@@ -1553,7 +1609,7 @@ def planos():
 
     conexao = conectar_banco()
 
-    usuario = conexao.execute("""
+    usuario = executar(conexao, """
         SELECT *
         FROM usuarios
         WHERE id = ?
@@ -1643,16 +1699,19 @@ def planos():
                             ✓ Relatórios
                         </p>
 
-                        <button>
+                        <a
+                            class="botao"
+                            href="/assinar-pro"
+                        >
                             Assinar Pro
-                        </button>
+                        </a>
 
                     </div>
 
                 </div>
 
                 <p>
-                    O pagamento ainda não está conectado.
+                    O pagamento do plano Pro é processado pelo Mercado Pago.
                 </p>
 
             </div>
@@ -1664,6 +1723,89 @@ def planos():
         css=CSS,
         menu=menu_lateral(usuario["plano"])
     )
+
+
+
+# =====================================================
+# ASSINATURA PRO - MERCADO PAGO
+# =====================================================
+
+@app.route("/assinar-pro")
+def assinar_pro():
+
+    if not usuario_logado():
+        return redirect("/login")
+
+    if not MERCADO_PAGO_ACCESS_TOKEN or not MERCADO_PAGO_PLAN_ID:
+        return (
+            "Mercado Pago ainda não está configurado no servidor.",
+            500
+        )
+
+    conexao = conectar_banco()
+
+    usuario = executar(conexao, """
+        SELECT *
+        FROM usuarios
+        WHERE id = ?
+    """, (
+        session["usuario_id"],
+    )).fetchone()
+
+    conexao.close()
+
+    if not usuario:
+        session.clear()
+        return redirect("/login")
+
+    url = "https://api.mercadopago.com/preapproval"
+
+    headers = {
+        "Authorization": f"Bearer {MERCADO_PAGO_ACCESS_TOKEN}",
+        "Content-Type": "application/json"
+    }
+
+    dados = {
+        "preapproval_plan_id": MERCADO_PAGO_PLAN_ID,
+        "reason": "OrçaFácil Pro",
+        "external_reference": str(usuario["id"]),
+        "payer_email": usuario["email"],
+        "back_url": request.url_root.rstrip("/") + "/planos"
+    }
+
+    try:
+        resposta = requests.post(
+            url,
+            json=dados,
+            headers=headers,
+            timeout=30
+        )
+    except requests.RequestException:
+        return (
+            "Não foi possível conectar ao Mercado Pago. "
+            "Tente novamente em alguns instantes.",
+            502
+        )
+
+    if resposta.status_code not in (200, 201):
+        return (
+            "Não foi possível iniciar a assinatura.<br><br>"
+            f"Código: {resposta.status_code}<br>"
+            f"Resposta: {resposta.text}",
+            502
+        )
+
+    assinatura = resposta.json()
+    link_pagamento = assinatura.get("init_point")
+
+    if not link_pagamento:
+        return (
+            "O Mercado Pago criou a assinatura, "
+            "mas não retornou o link de pagamento.",
+            502
+        )
+
+    return redirect(link_pagamento)
 
 
 # =====================================================
@@ -1678,7 +1820,7 @@ def gerar_pdf(id):
 
     conexao = conectar_banco()
 
-    item = conexao.execute("""
+    item = executar(conexao, """
         SELECT *
         FROM orcamentos
 
